@@ -9,7 +9,7 @@ The [payloadfuzz](https://github.com/epakskape/whpexp/tree/master/payloadfuzz) p
 
 ### Supported generators
 
-The reverse nop generator attempts to generate an x64 nop sled in a manner similar to [Opty2](https://github.com/rapid7/metasploit-framework/blob/master/modules/nops/x86/opty2.rb) in the Metasploit framework. To ensure that the nop sled can be executed from each offset, the nop sled is generated in reverse starting with the last byte and ending with the first byte. Rather than attempting to this in a smart way, the reverse nop generator simply attempts to brute force the set of valid bytes that can precede other bytes. This is woefully inefficient, but it's a useful example.
+The reverse nop generator attempts to generate an x64 nop sled in a manner similar to [Opty2](https://github.com/rapid7/metasploit-framework/blob/master/modules/nops/x86/opty2.rb) in the Metasploit framework. To ensure that the nop sled can be executed from each offset, the nop sled is generated in reverse starting with the last byte and ending with the first byte. Rather than attempting to do this in a smart way, the reverse nop generator simply attempts to brute force the set of valid bytes that can precede other bytes. This is woefully inefficient, but it's a useful example.
 
 ### Setup
 
