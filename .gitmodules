@@ -1,0 +1,6 @@
+[submodule "deps/libwhp"]
+	path = deps/libwhp
+	url = https://github.com/epakskape/libwhp
+[submodule "deps/rust-x86asm"]
+	path = deps/rust-x86asm
+	url = https://github.com/epakskape/rust-x86asm

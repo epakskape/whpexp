@@ -1,0 +1,17 @@
+[package]
+name = "payloadfuzz"
+version = "0.1.0"
+authors = ["Matt Miller <mmiller@hick.org>"]
+edition = "2018"
+
+[dependencies]
+libwhp = { path = "..\\deps\\libwhp" }
+x86asm = { path = "..\\deps\\rust-x86asm" }
+rand = "0.7.3"
+clap = "2.33.1"
+futures = "0.3.5"
+hex = "0.4.2"
+tokio = { version = "0.2.21", features = ["full"] }
+url = "2.1.1"
+redis = "0.16.0"
+async-std = "1.6.1"
