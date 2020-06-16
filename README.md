@@ -3,7 +3,7 @@ A collection of (not necessarily useful) Windows Hypervisor Platform experiments
 
 # payloadfuzz 
 
-The [payloadfuzz](https://www.github.com/epakskape/whpexp/payloadfuzz) project experiments with generating payloads in different ways and then executing them within a bare bones protected mode virtual machine.
+The [payloadfuzz](https://github.com/epakskape/whpexp/tree/master/payloadfuzz) project experiments with generating payloads in different ways and then executing them within a bare bones protected mode virtual machine.
 
 ## Installation
 
