@@ -35,7 +35,7 @@ cargo build
 
 ### Running
 
-To run payloadfuzz, simply specify the generator you wish to use (via `-g <generator>`) and the number of VMs to run in parallel (via `v <vm count>`).
+To run payloadfuzz, simply specify the generator you wish to use (via `-g <generator>`) and the number of VMs to run in parallel (via `-v <vm count>`).
 
 # Credits
 
