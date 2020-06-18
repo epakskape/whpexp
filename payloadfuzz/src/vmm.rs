@@ -20,10 +20,29 @@ use libwhp::*;
 const PDE64_PRESENT: u64 = 1;
 const PDE64_RW: u64 = 1 << 1;
 const PDE64_USER: u64 = 1 << 2;
-const PDE64_PS: u64 = 1 << 7;
 const CR4_PAE: u64 = 1 << 5;
 const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
+
+const PAGE_SIZE: u64 = 0x1000;
+const PTE_FRAME_BIT_OFFSET: u64 = 12;
+const PTE_FRAME_MASK: u64 = 0xF_FFFFFFFF;
+
+const PTE_PML4E_OFFSET: u64 = 39;
+const PTE_PML4E_MASK: u64 = 0x1ff;
+
+const PTE_PDPTE_OFFSET: u64 = 30;
+const PTE_PDPTE_MASK: u64 = 0x1ff;
+
+const PTE_PDE_OFFSET: u64 = 21;
+const PTE_PDE_MASK: u64 = 0x1ff;
+
+const PTE_PTE_OFFSET: u64 = 12;
+const PTE_PTE_MASK: u64 = 0x1ff;
+
+fn pte_get_physical_address(pte: u64) -> u64 {
+    ((pte >> PTE_FRAME_BIT_OFFSET) & PTE_FRAME_MASK) * PAGE_SIZE
+}
 
 const CR0_PE: u64 = 1;
 const CR0_MP: u64 = 1 << 1;
@@ -40,7 +59,7 @@ const INT_VECTOR: u32 = 0x35;
 #[derive(Clone)]
 pub struct VirtualMachineConfig {
     pub processor_count: u32,
-    pub physical_memory_size: usize,
+    pub memory_layout: MemoryLayout
 }
 
 pub struct VirtualMachine {
@@ -50,8 +69,8 @@ pub struct VirtualMachine {
     apic_enabled: bool,
     apic_present: bool,
     pub virtual_processors: Vec<Arc<RwLock<VirtualProcessorExtension>>>,
-    physical_memory: VirtualMemory,
-    physical_map: Option<GPARangeMapping>,
+    physical_memory_map: Vec<PhysicalMemoryMapping>,
+    pml4_addr: u64,
 }
 
 struct VirtualMachineCallbacks<'a> {
@@ -61,6 +80,61 @@ struct VirtualMachineCallbacks<'a> {
 pub struct VirtualProcessorExtension {
     pub vp: VirtualProcessor,
     pub last_exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+}
+
+#[derive(Clone)]
+pub enum MemoryProtection {
+    Read,
+    ReadWrite,
+    ReadWriteExecute
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum MemoryRegionType {
+    PageTables,
+    Code,
+    Data,
+    Stack
+}
+
+#[derive(Clone)]
+pub struct PhysicalMemoryRange {
+    pub base_address: u64,
+    pub region_size: usize,
+    pub ept_protection: MemoryProtection,
+    pub region_type: MemoryRegionType
+}
+
+pub struct PhysicalMemoryMapping {
+    pub physical_map: GPARangeMapping,
+    pub host_virtual_map: VirtualMemory,
+    pub region_type: MemoryRegionType,
+    pub allocated_page_map: Vec<bool>
+}
+
+#[derive(Clone)]
+pub struct MemoryDescriptor {
+    pub physical_address: u64,
+    pub virtual_protection: MemoryProtection
+}
+
+#[derive(Clone)]
+pub struct VirtualMemoryDescriptor {
+    pub base_address: u64,
+    pub region_type: MemoryRegionType,
+    pub memory_descriptors: Vec<MemoryDescriptor>
+}
+
+impl VirtualMemoryDescriptor {
+    pub fn get_region_size(&self) -> usize {
+        (self.memory_descriptors.len() * PAGE_SIZE as usize) as usize
+    }
+}
+
+#[derive(Clone)]
+pub struct MemoryLayout {
+    pub physical_layout: Vec<PhysicalMemoryRange>,
+    pub virtual_layout: Vec<VirtualMemoryDescriptor>,
 }
 
 impl<'a> VirtualMachine {
@@ -77,7 +151,6 @@ impl<'a> VirtualMachine {
         let capability = get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeFeatures).unwrap();
         let features: WHV_CAPABILITY_FEATURES = unsafe { capability.Features };
 
-        let physical_memory_size = vm_config.physical_memory_size;
         let processor_count = vm_config.processor_count;
 
         VirtualMachine {
@@ -87,8 +160,8 @@ impl<'a> VirtualMachine {
             apic_enabled: false,
             apic_present: features.LocalApicEmulation() != 0,
             virtual_processors: Vec::with_capacity(processor_count as usize),
-            physical_memory: VirtualMemory::new(physical_memory_size).unwrap(),
-            physical_map: None,
+            physical_memory_map: Vec::new(),
+            pml4_addr: 0
         }
     }
 
@@ -243,31 +316,45 @@ impl<'a> VirtualMachine {
     }
 
     fn setup_physical_memory(&mut self) {
-        let guest_address: WHV_GUEST_PHYSICAL_ADDRESS = 0;
+        for physical_region in &self.vm_config.memory_layout.physical_layout {
+            let virtual_map = VirtualMemory::new(physical_region.region_size)
+                .expect("virtual memory mapping failed");
 
-        // Map the payload into guest physical memory.
-        let res = self.partition.map_gpa_range(
-            &self.physical_memory,
-            guest_address,
-            self.physical_memory.get_size() as UINT64,
-            WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
-                | WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
-                | WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagExecute,
-        );
+            let physical_map_res =  self.partition.map_gpa_range(
+                &virtual_map,
+                physical_region.base_address,
+                physical_region.region_size as UINT64,
+                match physical_region.ept_protection {
+                    MemoryProtection::Read =>  {
+                        WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
+                    },
+                    MemoryProtection::ReadWrite => {
+                        WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
+                        | WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
+                    },
+                    MemoryProtection::ReadWriteExecute => {
+                        WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
+                        | WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
+                        | WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagExecute
+                    }
+                }
+            );
 
-        match res {
-            Ok(res_map) => {
-                self.physical_map = Some(res_map);
-            }
-            Err(err) => {
-                println!(
-                    "map_gpa_range fail {} - source_address={:X} guest_address={:X} size={:X}",
-                    err,
-                    self.physical_memory.as_ptr() as usize,
-                    guest_address,
-                    self.physical_memory.get_size()
-                );
-            }
+            let physical_map = match physical_map_res {
+                Ok(physical_map) => {
+                    physical_map
+                },
+                Err(err) => {
+                    panic!("map_gpa_range failed with {}", err);
+                }
+            };
+
+            self.physical_memory_map.push(PhysicalMemoryMapping {
+                host_virtual_map: virtual_map,
+                physical_map: physical_map,
+                region_type: physical_region.region_type,
+                allocated_page_map: Vec::new()
+            })
         }
     }
 
@@ -276,13 +363,154 @@ impl<'a> VirtualMachine {
         physical_address: usize,
         length: usize,
     ) -> &'a mut [u8] {
-        let s = self.physical_memory.as_slice_mut();
-        &mut s[physical_address..length]
+        for physical_mapping in &mut self.physical_memory_map {
+            let mapping_base_address = physical_mapping.physical_map.get_guest_address() as usize;
+            let mapping_size = physical_mapping.physical_map.get_size() as usize;
+
+            if physical_address >= mapping_base_address
+                && physical_address < mapping_base_address + mapping_size {
+                let s = physical_mapping.host_virtual_map.as_slice_mut();
+
+                let offset = physical_address - mapping_base_address;
+
+                return &mut s[offset..(offset+length)];
+            }
+        }
+
+        panic!("failed to find gpa {:X}", physical_address);
     }
 
     pub fn get_physical_memory_slice(&'a self, physical_address: usize, length: usize) -> &'a [u8] {
-        let s = &self.physical_memory.as_slice();
-        &s[physical_address..length]
+        for physical_mapping in &self.physical_memory_map {
+            let mapping_base_address = physical_mapping.physical_map.get_guest_address() as usize;
+            let mapping_size = physical_mapping.physical_map.get_size() as usize;
+
+            if physical_address >= mapping_base_address
+                && physical_address < mapping_base_address + mapping_size {
+                let s = physical_mapping.host_virtual_map.as_slice();
+
+                let offset = physical_address - mapping_base_address;
+
+                return &s[offset..(offset+length)];
+            }
+        }
+
+        panic!("failed to find gpa {:X}", physical_address);
+    }
+
+    fn get_virtual_region_by_type(&'a self, region_type: MemoryRegionType) -> &'a VirtualMemoryDescriptor {
+        for virtual_memory_desc in &self.vm_config.memory_layout.virtual_layout {
+            if virtual_memory_desc.region_type == region_type {
+                return &virtual_memory_desc;
+            }
+        }
+
+        panic!("failed to find region type");
+    }
+
+    fn initialize_address_space(& mut self) -> u64 {
+
+        let mut host_page_table_map_opt = None;
+
+        for map in &mut self.physical_memory_map {
+            if map.region_type == MemoryRegionType::PageTables {
+                host_page_table_map_opt = Some(map);
+                break;
+            }
+        }
+
+        if host_page_table_map_opt.is_none() {
+            panic!("failed to find page table mapping");
+        }
+
+        let host_page_table_map = host_page_table_map_opt.unwrap();
+        let max_page_table_pages = host_page_table_map.host_virtual_map.get_size() / (PAGE_SIZE as usize);
+
+        host_page_table_map.allocated_page_map = vec! [false; max_page_table_pages];
+
+        let page_table_base_gpa = host_page_table_map.physical_map.get_guest_address();
+        let page_table_base_hptr = host_page_table_map.host_virtual_map.as_ptr() as u64;
+       
+        // Allocate the PML4 page
+        let pml4_base_gpa = allocate_gpa(host_page_table_map);
+        let pml4_base_hptr = page_table_base_hptr + (pml4_base_gpa - page_table_base_gpa);
+
+        for virtual_memory_desc in &self.vm_config.memory_layout.virtual_layout {
+
+            let mut virtual_address = virtual_memory_desc.base_address;
+
+            for memory_desc in &virtual_memory_desc.memory_descriptors {
+
+                // PML4E lookup
+                let pml4e_hptr = pml4_base_hptr + (((virtual_address >> PTE_PML4E_OFFSET) & PTE_PML4E_MASK) * 8);
+                let pml4e = unsafe { *(pml4e_hptr as *mut u64) };
+
+                let pdpt_base_gpa;
+                if pml4e == 0 {
+                    pdpt_base_gpa = allocate_gpa(host_page_table_map);
+
+                    let pdpt_base_pfn = pdpt_base_gpa / PAGE_SIZE;
+
+                    unsafe { *(pml4e_hptr as *mut u64) = PDE64_PRESENT | PDE64_RW | PDE64_USER | (pdpt_base_pfn << PTE_FRAME_BIT_OFFSET) };
+                } else {
+                    pdpt_base_gpa = pte_get_physical_address(pml4e);
+                }
+        
+                // PDPTE lookup
+                let pdpt_base_hptr = page_table_base_hptr + (pdpt_base_gpa - page_table_base_gpa);
+                let pdpte_htpr = pdpt_base_hptr + (((virtual_address >> PTE_PDPTE_OFFSET) & PTE_PDPTE_MASK) * 8);
+                let pdpte = unsafe { *(pdpte_htpr as *mut u64) };
+                
+                let pde_base_gpa: u64;
+                if pdpte == 0 {
+                    pde_base_gpa = allocate_gpa(host_page_table_map);
+
+                    let pde_base_pfn = pde_base_gpa / PAGE_SIZE;
+
+                    unsafe { *(pdpte_htpr as *mut u64) = PDE64_PRESENT | PDE64_RW | PDE64_USER | (pde_base_pfn << PTE_FRAME_BIT_OFFSET) };
+                } else {
+                    pde_base_gpa = pte_get_physical_address(pdpte);
+                }
+                
+                // PDE lookup
+                let pde_base_hptr = page_table_base_hptr + (pde_base_gpa - page_table_base_gpa);
+                let pde_hptr = pde_base_hptr + (((virtual_address >> PTE_PDE_OFFSET) & PTE_PDE_MASK) * 8);
+                let pde = unsafe { *(pde_hptr as *mut u64) };
+
+                let pte_base_gpa: u64;
+                if pde == 0 {
+                    pte_base_gpa = allocate_gpa(host_page_table_map);
+
+                    let pte_base_pfn = pte_base_gpa / PAGE_SIZE;
+
+                    unsafe { *(pde_hptr as *mut u64) = PDE64_PRESENT | PDE64_RW | PDE64_USER | (pte_base_pfn << PTE_FRAME_BIT_OFFSET) };
+                } else {
+                    pte_base_gpa = pte_get_physical_address(pde);
+                }
+
+                // PTE initialization
+                let pte_base_hptr = page_table_base_hptr + (pte_base_gpa - page_table_base_gpa);
+                let pte_hptr = pte_base_hptr + (((virtual_address >> PTE_PTE_OFFSET) & PTE_PTE_MASK) * 8);
+
+                let mut pte_value = PDE64_PRESENT | PDE64_RW | PDE64_USER;
+                pte_value |= (memory_desc.physical_address / PAGE_SIZE) << PTE_FRAME_BIT_OFFSET;
+
+                match memory_desc.virtual_protection {
+                    MemoryProtection::Read
+                    | MemoryProtection::ReadWrite => {
+                        pte_value |= 1 << 63; // NX bit
+                    },
+                    _ => {}
+                }
+                
+                unsafe { *(pte_hptr as *mut u64) = pte_value };
+
+                // Proceed to the next virtual address.
+                virtual_address += PAGE_SIZE;
+            }
+        }
+
+        pml4_base_gpa
     }
 
     fn setup_virtual_processors(&mut self) {
@@ -294,8 +522,10 @@ impl<'a> VirtualMachine {
     fn setup_virtual_processor(&mut self, vp_index: u32) {
         let mut vp = self.partition.create_virtual_processor(vp_index).unwrap();
 
+        self.pml4_addr = self.initialize_address_space();
+
         // Setup long mode for this VP
-        self.set_initial_registers(&mut vp, 0);
+        self.set_initial_registers(&mut vp, 0, 0);
 
         // Configure the APIC
         self.setup_apic(&mut vp);
@@ -308,40 +538,14 @@ impl<'a> VirtualMachine {
         self.virtual_processors.push(Arc::new(vpe_rwlock));
     }
 
-    fn initialize_address_space(&self) -> u64 {
-        let mem_addr = self.physical_memory.as_ptr() as u64;
-
-        let pml4_addr: u64 = 0x9000;
-        let pdpt_addr: u64 = 0xa000;
-        let pd_addr: u64 = 0xb000;
-        let pml4: u64 = mem_addr + pml4_addr;
-        let pdpt: u64 = mem_addr + pdpt_addr;
-        let pd: u64 = mem_addr + pd_addr;
-
-        unsafe {
-            *(pml4 as *mut u64) = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdpt_addr;
-            *(pdpt as *mut u64) = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
-
-            for i in 0..512 {
-                *((pd + i * 8) as *mut u64) =
-                    (i << 21) + (PDE64_PRESENT | PDE64_RW | PDE64_USER | PDE64_PS);
-            }
-        }
-
-        // Return the PML4 guest physical address so the caller can use it to set CR3
-        pml4_addr
-    }
-
-    pub fn set_initial_registers(&self, vp: &mut VirtualProcessor, gpr_default_value: u64) {
-        let pml4_addr = self.initialize_address_space();
-
+    pub fn set_initial_registers(&self, vp: &mut VirtualProcessor, gpr_default_value: u64, initial_rip: u64) {
         const NUM_REGS: UINT32 = 28;
         let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS as usize] = Default::default();
         let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
 
         // Initialize control registers with protected mode enabled but paging disabled initially.
         reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterCr3;
-        reg_values[0].Reg64 = pml4_addr;
+        reg_values[0].Reg64 = self.pml4_addr;
         reg_names[1] = WHV_REGISTER_NAME::WHvX64RegisterCr4;
         reg_values[1].Reg64 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
 
@@ -393,11 +597,12 @@ impl<'a> VirtualMachine {
         reg_values[10].Reg64 = 0x0002;
 
         reg_names[11] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-        reg_values[11].Reg64 = 0x0;
+        reg_values[11].Reg64 = initial_rip;
 
         // Create stack with stack base at high end of mapped payload
         reg_names[12] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
-        reg_values[12].Reg64 = self.vm_config.physical_memory_size as UINT64;
+        let stack_region = self.get_virtual_region_by_type(MemoryRegionType::Stack);
+        reg_values[12].Reg64 = stack_region.base_address + stack_region.get_region_size() as UINT64;
 
         reg_names[13] = WHV_REGISTER_NAME::WHvX64RegisterRax;
         reg_values[13].Reg64 = gpr_default_value;
@@ -606,4 +811,27 @@ impl<'a> EmulatorCallbacks for VirtualMachineCallbacks<'a> {
         *gpa = gpa1;
         S_OK
     }
+}
+
+fn allocate_gpa(mapping: &mut PhysicalMemoryMapping) -> u64 {
+
+    let mut pfn = 0;
+    let mut found_pfn = false;
+
+    for entry in &mapping.allocated_page_map {
+        if *entry == false {
+            found_pfn = true;
+            break;
+        }
+
+        pfn += 1;
+    }
+
+    if found_pfn == false {
+        panic!("ran out of physical memory to allocate");
+    }
+
+    mapping.allocated_page_map[pfn] = true;
+
+    mapping.physical_map.get_guest_address() + (pfn as u64 * PAGE_SIZE)
 }

@@ -6,7 +6,8 @@ pub trait PayloadGenerator {
         &self,
         previous_payload: &[u8],
         new_payload: &[u8],
-        rip: usize,
+        initial_rip: usize,
+        final_rip: usize,
         initial_rsp: usize,
         final_rsp: usize,
     ) -> bool;
@@ -51,7 +52,8 @@ impl PayloadGenerator for ReverseNopGenerator {
         &self,
         _previous_payload: &[u8],
         new_payload: &[u8],
-        rip: usize,
+        initial_rip: usize,
+        final_rip: usize,
         initial_rsp: usize,
         final_rsp: usize,
     ) -> bool {
@@ -61,7 +63,8 @@ impl PayloadGenerator for ReverseNopGenerator {
         }
 
         // Require the payload to have executed all of the instructions in it.
-        if rip as usize == new_payload.len() {
+        if final_rip > initial_rip 
+            && (final_rip - initial_rip) as usize == new_payload.len() {
             return true;
         } else {
             return false;

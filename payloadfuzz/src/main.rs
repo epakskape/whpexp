@@ -37,7 +37,8 @@ use redis::RedisResult;
 use std::io::Cursor;
 use x86asm::{InstructionReader, Mnemonic, Mode};
 
-const MAX_PAYLOAD: usize = 1024;
+const CODE_VIRTUAL_BASE_ADDRESS: u64 = 0x20000000;
+const CODE_REGION_SIZE: u64 = 4096;
 
 #[tokio::main]
 async fn main() {
@@ -124,7 +125,53 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
             vm_num as usize,
             VirtualMachineConfig {
                 processor_count: 1,
-                physical_memory_size: 0x400000,
+                memory_layout: MemoryLayout {
+                    physical_layout: vec! [
+                        PhysicalMemoryRange {
+                            base_address: 0x10000000,
+                            region_size: 0x400000,
+                            region_type: MemoryRegionType::PageTables,
+                            ept_protection: MemoryProtection::ReadWrite
+                        },
+                        PhysicalMemoryRange {
+                            base_address: 0x20000000,
+                            region_size: CODE_REGION_SIZE as usize,
+                            region_type: MemoryRegionType::Code,
+                            ept_protection: MemoryProtection::ReadWriteExecute
+                        },
+                        PhysicalMemoryRange {
+                            base_address: 0x30000000,
+                            region_size: 0x1000,
+                            region_type: MemoryRegionType::Stack,
+                            ept_protection: MemoryProtection::ReadWrite
+                        }
+                    ],
+                    virtual_layout: vec! [
+                        // Code virtual mapping
+                        VirtualMemoryDescriptor {
+                            base_address: CODE_VIRTUAL_BASE_ADDRESS,
+                            region_type: MemoryRegionType::Code,
+                            memory_descriptors: vec! [
+                                MemoryDescriptor {
+                                    physical_address: 0x20000000,
+                                    virtual_protection: MemoryProtection::ReadWriteExecute
+                                }
+                            ]
+                        },
+
+                        // Stack virtual mapping
+                        VirtualMemoryDescriptor {
+                            base_address: 0x30000000,
+                            region_type: MemoryRegionType::Stack,
+                            memory_descriptors: vec! [
+                                MemoryDescriptor {
+                                    physical_address: 0x30000000,
+                                    virtual_protection: MemoryProtection::ReadWrite
+                                }
+                            ]
+                        },
+                    ]
+                },
             },
         );
 
@@ -143,7 +190,7 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
             std::io::stdout().flush().ok();
         }
 
-        let mut buf: Vec<u8> = vec![0; MAX_PAYLOAD];
+        let mut buf: Vec<u8> = vec![0xcc; CODE_REGION_SIZE as usize];
 
         let mut previous_payload: Vec<u8>;
 
@@ -183,13 +230,14 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
 
         buf_slice.copy_from_slice(&new_payload);
 
-        // Ensure the new payload has a breakpoint at the end.
-        buf[new_payload.len()] = 0xcc;
+        let initial_rip = (CODE_VIRTUAL_BASE_ADDRESS + CODE_REGION_SIZE) as usize - new_payload.len();
 
-        // Copy the staging buffer into physical memory for the VM.
+        // Copy the staging buffer into physical memory for the VM at the end of
+        // the mapping to ensure that any attempt to execute beyond the mapping
+        // will fault.
         {
-            let mem = vm.get_physical_memory_slice_mut(0, buf.len());
-            mem.copy_from_slice(buf.as_slice());
+            let mem = vm.get_physical_memory_slice_mut(initial_rip, new_payload.len());
+            mem.copy_from_slice(buf_slice);
         }
 
         let initial_rsp: usize;
@@ -198,7 +246,7 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
 
             // Set the general purpose registers to a high value to increase the likelihood of
             // generating a memory access fault if they are used to access memory.
-            vm.set_initial_registers(&mut vpe0.vp, 0xf1f1f1f1_f1f1f1f1);
+            vm.set_initial_registers(&mut vpe0.vp, 0xf1f1f1f1_f1f1f1f1, initial_rip as u64);
 
             // Get the initial stack pointer for later comparison.
             let mut reg_names: [WHV_REGISTER_NAME; 1 as usize] = Default::default();
@@ -269,27 +317,25 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
 
             let final_rsp = unsafe { reg_values[0].Reg64 };
 
-            // If the instruction pointer exceeds the size of physical memory or the instruction pointer
-            // is zero (meaning the instruction didn't execute), then continue to the next payload
-            // as this one is invalid.
-            if rip > vm.vm_config.physical_memory_size || rip == 0 {
+            // If the instruction pointer is equal to the start of the code
+            // mapping (meaning the instruction didn't execute), then continue
+            // to the next payload as this one is invalid.
+            if rip <= CODE_VIRTUAL_BASE_ADDRESS as usize 
+                || rip > CODE_VIRTUAL_BASE_ADDRESS as usize + 0x1000 {
                 continue;
             }
 
-            let current_payload = vm.get_physical_memory_slice(0, rip);
-
-            let min_len = std::cmp::min(current_payload.len(), new_payload.len() as usize);
-
-            let current_payload_slice = &current_payload[0..min_len];
-            let starting_payload_slice = &buf[0..min_len];
+            let current_payload = vm.get_physical_memory_slice(initial_rip as usize, new_payload.len());
+            let starting_payload_slice = &buf[0..new_payload.len()];
 
             // Test to see if the payload is generally valid and that the specific generator we are using
             // considers it to be valid. If it is valid, then we'll add the payload to the valid set
             // in redis, otherwise we'll add it to the invalid set.
-            if is_generally_valid(current_payload_slice, starting_payload_slice)
+            if is_generally_valid(current_payload, starting_payload_slice)
                 && generator.is_valid(
                     &previous_payload,
                     &new_payload,
+                    initial_rip,
                     rip,
                     initial_rsp,
                     final_rsp as usize,
@@ -297,7 +343,7 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
             {
                 num_valid += 1;
 
-                let payload_hex = hex::encode(&current_payload_slice);
+                let payload_hex = hex::encode(&current_payload);
 
                 let dur = Duration::from_secs(2);
                 let set_fut: RedisFuture<()> = redis_con.sadd("valid", &payload_hex);
@@ -319,10 +365,6 @@ async fn worker<T: PayloadGenerator + ?Sized>(vm_num: u32, generator: &mut T) {
     //   - the current payload in memory matches the initial version that was stored in memory (e.g. not corrupted).
     //   - the current payload does not contain a branch instruction
     fn is_generally_valid(current_payload: &[u8], starting_payload: &[u8]) -> bool {
-        if current_payload.len() > MAX_PAYLOAD {
-            return false;
-        }
-
         // Check to see if the payload itself was modified in memory.
         if current_payload != starting_payload {
             return false;
@@ -417,13 +459,62 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::Mutex;
 
+    const CODE_VIRTUAL_BASE_ADDRESS: u64 = 0x20000000;
+    const CODE_REGION_SIZE: u64 = 4096;
+
     #[test]
     pub fn test_vm_create() {
         let mut vm = VirtualMachine::new(
             1,
             VirtualMachineConfig {
                 processor_count: 1,
-                physical_memory_size: 0x4000000, // 64MB
+                memory_layout: MemoryLayout {
+                    physical_layout: vec! [
+                        PhysicalMemoryRange {
+                            base_address: 0x10000000,
+                            region_size: 0x400000,
+                            region_type: MemoryRegionType::PageTables,
+                            ept_protection: MemoryProtection::ReadWrite
+                        },
+                        PhysicalMemoryRange {
+                            base_address: 0x20000000,
+                            region_size: CODE_REGION_SIZE as usize,
+                            region_type: MemoryRegionType::Code,
+                            ept_protection: MemoryProtection::ReadWriteExecute
+                        },
+                        PhysicalMemoryRange {
+                            base_address: 0x30000000,
+                            region_size: 0x1000,
+                            region_type: MemoryRegionType::Stack,
+                            ept_protection: MemoryProtection::ReadWrite
+                        }
+                    ],
+                    virtual_layout: vec! [
+                        // Code virtual mapping
+                        VirtualMemoryDescriptor {
+                            base_address: CODE_VIRTUAL_BASE_ADDRESS,
+                            region_type: MemoryRegionType::Code,
+                            memory_descriptors: vec! [
+                                MemoryDescriptor {
+                                    physical_address: 0x20000000,
+                                    virtual_protection: MemoryProtection::ReadWriteExecute
+                                }
+                            ]
+                        },
+
+                        // Stack virtual mapping
+                        VirtualMemoryDescriptor {
+                            base_address: 0x30000000,
+                            region_type: MemoryRegionType::Stack,
+                            memory_descriptors: vec! [
+                                MemoryDescriptor {
+                                    physical_address: 0x30000000,
+                                    virtual_protection: MemoryProtection::ReadWrite
+                                }
+                            ]
+                        },
+                    ]
+                },
             },
         );
 
