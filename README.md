@@ -31,6 +31,7 @@ Use the following steps to clone and build payloadfuzz.
 
 ```
 git clone https://github.com/epakskape/whpexp
+cd whpexp
 git submodule init
 git submodule update
 cd payloadfuzz
